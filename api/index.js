@@ -1,6 +1,6 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const http = require("http");
+
 const { GoogleSpreadsheet } = require("google-spreadsheet");
 const { JWT } = require("google-auth-library");
 const nodemailer = require("nodemailer");
@@ -8,15 +8,14 @@ const nodemailer = require("nodemailer");
 const credentials = require("../google-sheet-api.json");
 
 const PRIVATE_KEY = (credentials.private_key || "").replace(/\\n/g, "\n");
+
 if (!credentials.client_email || !PRIVATE_KEY) {
   throw new Error("google-sheet-api.json is missing client_email or private_key");
 }
+
 if (!PRIVATE_KEY.includes("BEGIN PRIVATE KEY") || !PRIVATE_KEY.includes("END PRIVATE KEY")) {
   throw new Error("google-sheet-api.json private_key format is invalid (missing PEM markers)");
 }
-
-const PORT = 5000;
-const HOST = "0.0.0.0";
 
 const SHEET_ID =
   process.env.GOOGLE_SHEET_ID || "1FEB2SbX7AAPLhQxPE7IHmmBGBbYxnNj6iVRPBuavic0";
@@ -31,8 +30,6 @@ const mailTransport = nodemailer.createTransport({
   port: SMTP_PORT,
   secure: SMTP_PORT === 465,
   auth: SMTP_USER && SMTP_PASS ? { user: SMTP_USER, pass: SMTP_PASS } : undefined,
-  logger: true,
-  debug: true,
 });
 
 // Google Auth
@@ -47,54 +44,16 @@ const validateGoogleAuth = async () => {
     await auth.authorize();
     console.info("Google service account JWT verified");
   } catch (err) {
-    console.error("Google service account auth failed", {
-      message: err?.message,
-      code: err?.code,
-      stack: err?.stack,
-    });
+    console.error("Google service account auth failed", err);
     throw err;
   }
 };
 
-const sendJson = (res, status, payload) => {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  });
-  res.end(body);
-};
-
-const parseBody = (req) =>
-  new Promise((resolve, reject) => {
-    let raw = "";
-
-    req.on("data", (chunk) => {
-      raw += chunk;
-
-      if (raw.length > 1_000_000) {
-        req.destroy();
-        reject(new Error("Payload too large"));
-      }
-    });
-
-    req.on("end", () => {
-      try {
-        const json = raw ? JSON.parse(raw) : {};
-        resolve(json);
-      } catch (err) {
-        reject(err);
-      }
-    });
-
-    req.on("error", reject);
-  });
-     // check for email already registered from the sheet and reject if found
- const isEmailRegistered = async (email) => {
-
+// check for email already registered
+const isEmailRegistered = async (email) => {
   const doc = new GoogleSpreadsheet(SHEET_ID, auth);
-  await doc.loadInfo();
 
+  await doc.loadInfo();
   const sheet = doc.sheetsByIndex[0];
 
   try {
@@ -104,14 +63,10 @@ const parseBody = (req) =>
   }
 
   const rows = await sheet.getRows();
-
   const normalizedEmail = email.trim().toLowerCase();
-
-  console.log("Checking rows:", rows.map(r => r.get("email")));
 
   const exists = rows.some((row) => {
     const sheetEmail = row.get("email");
-
     if (!sheetEmail) return false;
 
     return sheetEmail.trim().toLowerCase() === normalizedEmail;
@@ -119,24 +74,21 @@ const parseBody = (req) =>
 
   return exists;
 };
-const appendRow = async ({ name, email, note }) => {
 
+const appendRow = async ({ name, email, note }) => {
   const doc = new GoogleSpreadsheet(SHEET_ID, auth);
 
   await doc.loadInfo();
-
   const sheet = doc.sheetsByIndex[0];
 
   const requiredHeaders = ["name", "email", "note", "created_at"];
- 
 
   try {
     await sheet.loadHeaderRow();
-  } catch (err) {
-    // Sheet is empty → create header row
+  } catch {
     await sheet.setHeaderRow(requiredHeaders);
   }
-  
+
   await sheet.addRow({
     name,
     email,
@@ -152,20 +104,12 @@ const sendConfirmationEmail = async ({ name, email }) => {
 
   const senderEmail = process.env.MAIL_FROM || SMTP_USER || "no-reply@example.com";
 
-  console.info("Sending confirmation email", {
-    to: email,
+  const info = await mailTransport.sendMail({
+    from: { address: senderEmail, name: "Pre-Registration" },
     sender: senderEmail,
-    transport: SMTP_HOST,
-    port: SMTP_PORT,
-  });
-
-  try {
-    const info = await mailTransport.sendMail({
-      from: { address: senderEmail, name: "Pre-Registration" },
-      sender: senderEmail,
-      to: [{ address: email, name }],
-      subject: "Registration received",
-       html: `<div style="background:#0f0f17;padding:30px;font-family:Arial,Helvetica,sans-serif;">
+    to: [{ address: email, name }],
+    subject: "Registration received",
+    html: `<div style="background:#0f0f17;padding:30px;font-family:Arial,Helvetica,sans-serif;">
   <table align="center" width="520" style="background:#151523;border-radius:10px;color:#ffffff;text-align:center;padding:30px;">
     
     <tr>
@@ -207,125 +151,60 @@ const sendConfirmationEmail = async ({ name, email }) => {
 
   </table>
 </div>`,
-    });
+  });
 
-    console.info("Confirmation email sent", {
-      to: email,
-      messageId: info?.messageId,
-      response: info?.response,
-      accepted: info?.accepted,
-      rejected: info?.rejected,
-    });
-  } catch (err) {
-    console.error("Confirmation email failed", {
-      to: email,
-      sender: senderEmail,
-      transport: SMTP_HOST,
-      port: SMTP_PORT,
-      code: err?.code,
-      command: err?.command,
-      response: err?.response,
-      message: err?.message,
-    });
-    throw err;
-  }
+  return info;
 };
 
-const server = http.createServer(async (req, res) => {
+module.exports = async function handler(req, res) {
 
-  if (req.url === "/health" && req.method === "GET") {
-    return sendJson(res, 200, {
+  await validateGoogleAuth();
+
+  if (req.method === "GET") {
+    return res.status(200).json({
       status: "ok",
-      uptime: process.uptime(),
       timestamp: new Date().toISOString(),
     });
   }
 
-  if (req.url === "/records" && req.method === "POST") {
-
-    if (!req.headers["content-type"]?.includes("application/json")) {
-      return sendJson(res, 415, {
-        error: "Content-Type must be application/json",
-      });
-    }
-
+  if (req.method === "POST") {
     try {
-      const body = await parseBody(req);
 
-      const { name, email, note = "" } = body;
+      const { name, email, note = "" } = req.body;
 
       if (!name || !email) {
-        return sendJson(res, 400, {
+        return res.status(400).json({
           error: "name and email are required",
         });
       }
 
       const alreadyRegistered = await isEmailRegistered(email);
 
-if (alreadyRegistered) {
-  return sendJson(res, 409, {
-    error: "This email is already registered",
-  });
-}
-
-await appendRow({ name, email, note });
-
-      try {
-        await sendConfirmationEmail({ name, email });
-      } catch (emailErr) {
-        console.error(
-          "Failed to send confirmation email",
-          emailErr?.stack || emailErr
-        );
-
-        return sendJson(res, 502, {
-          error: "Record saved but email could not be sent",
-          detail: emailErr?.message || "Email delivery failed",
+      if (alreadyRegistered) {
+        return res.status(409).json({
+          error: "This email is already registered",
         });
       }
 
-      return sendJson(res, 201, {
+      await appendRow({ name, email, note });
+
+      await sendConfirmationEmail({ name, email });
+
+      return res.status(201).json({
         status: "created",
       });
 
     } catch (err) {
 
-      const status = err?.message?.includes("Payload too large") ? 413 : 500;
-
-      return sendJson(res, status, {
+      return res.status(500).json({
         error: "Unable to create record",
         detail: err?.message || "Unknown error",
       });
+
     }
   }
 
-  return sendJson(res, 404, { error: "Not found" });
-
-});
-
-server.listen(PORT, HOST, () => {
-  validateGoogleAuth().catch(() => {
-    console.error("Server exiting due to Google auth failure");
-    process.exit(1);
+  return res.status(405).json({
+    error: "Method not allowed",
   });
-
-  mailTransport.verify((err, success) => {
-    if (err) {
-      console.error("SMTP verify failed", {
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        user: SMTP_USER,
-        code: err?.code,
-        command: err?.command,
-        message: err?.message,
-      });
-    } else {
-      console.info("SMTP connection verified", {
-        host: SMTP_HOST,
-        port: SMTP_PORT,
-        user: SMTP_USER,
-        success,
-      });
-    }
-  });
-});
+};
